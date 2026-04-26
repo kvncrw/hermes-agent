@@ -12395,7 +12395,7 @@ class GatewayRunner:
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
-    
+
     Runs inside the gateway process so cronjobs fire automatically without
     needing a separate `hermes cron daemon` or system cron entry.
 
@@ -12405,7 +12405,15 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     Also refreshes the channel directory every 5 minutes and prunes the
     image/audio/document cache + expired ``hermes debug share`` pastes
     once per hour.
+
+    Tick execution is offloaded to a worker thread so a long-running tick
+    (e.g. a Conductor orchestrator that sessions_yield's for 20 minutes)
+    cannot stall this ticker. If the previous tick is still in flight when
+    the next interval elapses, we skip submission for that cycle — the
+    file-based flock in cron.scheduler.tick() already enforces at-most-one
+    concurrent tick, so we just need this thread to keep iterating.
     """
+    import concurrent.futures
     from cron.scheduler import tick as cron_tick
     from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
     from hermes_cli.debug import _sweep_expired_pastes
@@ -12415,72 +12423,96 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
 
-    logger.info("Cron ticker started (interval=%ds)", interval)
+    # Single worker is enough — the file lock guarantees at-most-one tick.
+    # We just need a place to park the long-running call so the ticker loop
+    # itself stays responsive.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-tick")
+    in_flight: Optional[concurrent.futures.Future] = None
+    long_run_warned = False
+
+    logger.info("Cron ticker started (interval=%ds, deadlock-free)", interval)
     tick_count = 0
-    while not stop_event.is_set():
-        try:
-            cron_tick(verbose=False, adapters=adapters, loop=loop)
-        except Exception as e:
-            logger.debug("Cron tick error: %s", e)
-
-        tick_count += 1
-
-        if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
-            try:
-                from gateway.channel_directory import build_channel_directory
-                if loop is not None:
-                    # build_channel_directory is async (Slack web calls), and
-                    # this ticker runs in a background thread. Schedule onto
-                    # the gateway event loop and wait briefly for completion
-                    # so refresh failures are still logged via the except.
-                    fut = asyncio.run_coroutine_threadsafe(
-                        build_channel_directory(adapters), loop
+    try:
+        while not stop_event.is_set():
+            # Only schedule a new tick if the previous one has finished.
+            if in_flight is None or in_flight.done():
+                if in_flight is not None and in_flight.done():
+                    # Surface any exception the previous tick raised.
+                    exc = in_flight.exception()
+                    if exc is not None:
+                        logger.debug("Cron tick error: %s", exc)
+                    long_run_warned = False
+                in_flight = pool.submit(cron_tick, verbose=False, adapters=adapters, loop=loop)
+            else:
+                # Previous tick still running — log periodically so a stuck
+                # tick is visible in operator logs.
+                if not long_run_warned:
+                    logger.warning(
+                        "Cron tick still running after %ds; skipping submission this cycle",
+                        interval,
                     )
-                    fut.result(timeout=30)
-            except Exception as e:
-                logger.debug("Channel directory refresh error: %s", e)
+                    long_run_warned = True
 
-        if tick_count % IMAGE_CACHE_EVERY == 0:
-            try:
-                removed = cleanup_image_cache(max_age_hours=24)
-                if removed:
-                    logger.info("Image cache cleanup: removed %d stale file(s)", removed)
-            except Exception as e:
-                logger.debug("Image cache cleanup error: %s", e)
-            try:
-                removed = cleanup_document_cache(max_age_hours=24)
-                if removed:
-                    logger.info("Document cache cleanup: removed %d stale file(s)", removed)
-            except Exception as e:
-                logger.debug("Document cache cleanup error: %s", e)
+            tick_count += 1
 
-        if tick_count % PASTE_SWEEP_EVERY == 0:
-            try:
-                deleted, remaining = _sweep_expired_pastes()
-                if deleted:
-                    logger.info(
-                        "Paste sweep: deleted %d expired paste(s), %d pending",
-                        deleted, remaining,
+            if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
+                try:
+                    from gateway.channel_directory import build_channel_directory
+                    if loop is not None:
+                        # build_channel_directory is async (Slack web calls), and
+                        # this ticker runs in a background thread. Schedule onto
+                        # the gateway event loop and wait briefly for completion
+                        # so refresh failures are still logged via the except.
+                        fut = asyncio.run_coroutine_threadsafe(
+                            build_channel_directory(adapters), loop
+                        )
+                        fut.result(timeout=30)
+                except Exception as e:
+                    logger.debug("Channel directory refresh error: %s", e)
+
+            if tick_count % IMAGE_CACHE_EVERY == 0:
+                try:
+                    removed = cleanup_image_cache(max_age_hours=24)
+                    if removed:
+                        logger.info("Image cache cleanup: removed %d stale file(s)", removed)
+                except Exception as e:
+                    logger.debug("Image cache cleanup error: %s", e)
+                try:
+                    removed = cleanup_document_cache(max_age_hours=24)
+                    if removed:
+                        logger.info("Document cache cleanup: removed %d stale file(s)", removed)
+                except Exception as e:
+                    logger.debug("Document cache cleanup error: %s", e)
+
+            if tick_count % PASTE_SWEEP_EVERY == 0:
+                try:
+                    deleted, remaining = _sweep_expired_pastes()
+                    if deleted:
+                        logger.info(
+                            "Paste sweep: deleted %d expired paste(s), %d pending",
+                            deleted, remaining,
+                        )
+                except Exception as e:
+                    logger.debug("Paste sweep error: %s", e)
+
+            # Curator — piggy-back on the existing cron ticker so long-running
+            # gateways get weekly skill maintenance without needing restarts.
+            # maybe_run_curator() is internally gated by config.interval_hours
+            # (7 days by default), so CURATOR_EVERY is just the poll rate — the
+            # real work only fires once per config interval.
+            if tick_count % CURATOR_EVERY == 0:
+                try:
+                    from agent.curator import maybe_run_curator
+                    maybe_run_curator(
+                        idle_for_seconds=float("inf"),
+                        on_summary=lambda msg: logger.info("curator: %s", msg),
                     )
-            except Exception as e:
-                logger.debug("Paste sweep error: %s", e)
+                except Exception as e:
+                    logger.debug("Curator tick error: %s", e)
 
-        # Curator — piggy-back on the existing cron ticker so long-running
-        # gateways get weekly skill maintenance without needing restarts.
-        # maybe_run_curator() is internally gated by config.interval_hours
-        # (7 days by default), so CURATOR_EVERY is just the poll rate — the
-        # real work only fires once per config interval.
-        if tick_count % CURATOR_EVERY == 0:
-            try:
-                from agent.curator import maybe_run_curator
-                maybe_run_curator(
-                    idle_for_seconds=float("inf"),
-                    on_summary=lambda msg: logger.info("curator: %s", msg),
-                )
-            except Exception as e:
-                logger.debug("Curator tick error: %s", e)
-
-        stop_event.wait(timeout=interval)
+            stop_event.wait(timeout=interval)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=False)
     logger.info("Cron ticker stopped")
 
 
