@@ -408,16 +408,48 @@ class TestAdvanceNextRun:
         new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert new_next_dt > _hermes_now(), "next_run_at should be in the future after advance"
 
-    def test_skips_oneshot_job(self, tmp_cron_dir):
-        """One-shot jobs should NOT be advanced — they need to retry on restart."""
+    def test_disables_oneshot_job(self, tmp_cron_dir):
+        """One-shot jobs should be disabled with next_run_at cleared so they
+        cannot be re-fired by a subsequent tick if mark_job_run later fails
+        (jobs.json IO error, gateway crash, etc). Real-world incident:
+        long-running Conductor orchestrator was billed three times because
+        mark_job_run threw permission errors while writing jobs.json.
+        """
         job = create_job(prompt="Run once", schedule="30m")
-        original_next = get_job(job["id"])["next_run_at"]
+        assert get_job(job["id"])["enabled"] is True
+        assert get_job(job["id"])["next_run_at"] is not None
 
         result = advance_next_run(job["id"])
-        assert result is False
+        assert result is True
 
         updated = get_job(job["id"])
-        assert updated["next_run_at"] == original_next, "one-shot next_run_at should be unchanged"
+        assert updated["enabled"] is False, "one-shot should be disabled after advance"
+        assert updated["next_run_at"] is None, "one-shot next_run_at should be cleared"
+
+    def test_disables_oneshot_idempotent(self, tmp_cron_dir):
+        """Calling advance_next_run twice on a one-shot is a no-op the second
+        time — the job is already disabled with no next_run_at."""
+        job = create_job(prompt="Run once", schedule="30m")
+        first = advance_next_run(job["id"])
+        assert first is True
+        second = advance_next_run(job["id"])
+        assert second is False, "second call should report no change"
+
+    def test_oneshot_not_redue_after_advance(self, tmp_cron_dir):
+        """After advance, a one-shot must not appear in get_due_jobs even if
+        mark_job_run never runs. This is the bug fix — pre-fix, a one-shot
+        whose mark_job_run failed would re-fire on every subsequent tick."""
+        from cron.jobs import get_due_jobs
+
+        job = create_job(prompt="Run once", schedule="30m")
+        # Force next_run_at to 5 minutes ago so the job is due
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+        assert len(get_due_jobs()) == 1
+
+        advance_next_run(job["id"])
+        assert len(get_due_jobs()) == 0, "one-shot must not be re-due after advance"
 
     def test_nonexistent_job_returns_false(self, tmp_cron_dir):
         result = advance_next_run("nonexistent-id")

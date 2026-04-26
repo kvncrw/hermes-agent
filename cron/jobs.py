@@ -712,22 +712,41 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
 
 def advance_next_run(job_id: str) -> bool:
-    """Preemptively advance next_run_at for a recurring job before execution.
+    """Preemptively advance next_run_at for a job before execution.
 
-    Call this BEFORE run_job() so that if the process crashes mid-execution,
-    the job won't re-fire on the next gateway restart.  This converts the
-    scheduler from at-least-once to at-most-once for recurring jobs — missing
-    one run is far better than firing dozens of times in a crash loop.
+    Call this BEFORE run_job() so that if the process crashes mid-execution
+    (or mark_job_run later fails to write jobs.json — e.g. from a permissions
+    error after a kubectl exec mutation, or any IO failure), the job won't
+    re-fire on the next gateway restart or tick.  This converts the
+    scheduler from at-least-once to at-most-once.
 
-    One-shot jobs are left unchanged so they can still retry on restart.
+    For recurring jobs (cron/interval): advance next_run_at to the next
+    scheduled time computed from the schedule.
 
-    Returns True if next_run_at was advanced, False otherwise.
+    For one-shot (kind="once") jobs: clear next_run_at and disable. Once
+    a one-shot has been picked up by a tick, mark_job_run is the
+    authoritative writer for last_run_at + last_status, but the in-flight
+    enabled flag flip here is what guarantees the same job can't be
+    re-fired by a subsequent tick if mark_job_run never gets the chance
+    to run.  Real-world incident: jobs.json went root-owned after a
+    kubectl exec, mark_job_run threw IOError, and a long-running
+    Conductor orchestrator job was re-fired 3 times — three separate
+    multi-minute LLM executions billed.
+
+    Returns True if the job's schedule fields were changed.
     """
     with _jobs_file_lock:
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
                 kind = job.get("schedule", {}).get("kind")
+                if kind == "once":
+                    if not job.get("enabled", True) and job.get("next_run_at") is None:
+                        return False
+                    job["next_run_at"] = None
+                    job["enabled"] = False
+                    save_jobs(jobs)
+                    return True
                 if kind not in ("cron", "interval"):
                     return False
                 now = _hermes_now().isoformat()
