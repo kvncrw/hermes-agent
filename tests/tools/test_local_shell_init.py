@@ -214,6 +214,41 @@ class TestSnapshotEndToEnd:
         assert "PROBE=probe-ok" in output
         assert "/opt/shell-init-probe/bin" in output
 
+    def test_snapshot_preserves_process_path_through_login_shell(
+        self, tmp_path, monkeypatch
+    ):
+        """Kubernetes injects tool dirs through container env PATH.
+
+        ``bash -l`` can reset PATH before the snapshot is written, which makes
+        terminal commands unable to find tools that are present in the pod
+        environment.  The login snapshot should re-merge the process PATH.
+        """
+        tool_bin = tmp_path / "agent-tools" / "bin"
+        tool_bin.mkdir(parents=True)
+        probe = tool_bin / "pathprobe"
+        probe.write_text("#!/bin/sh\necho pathprobe-ok\n")
+        probe.chmod(0o755)
+
+        env_path = f"{tool_bin}:{os.environ.get('PATH', '')}"
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], False),
+        ):
+            env = LocalEnvironment(
+                cwd=str(tmp_path),
+                timeout=15,
+                env={"PATH": env_path},
+            )
+            try:
+                result = env.execute("command -v pathprobe && pathprobe")
+            finally:
+                env.cleanup()
+
+        output = result.get("output", "")
+        assert str(probe) in output
+        assert "pathprobe-ok" in output
+
     def test_profile_path_export_survives_bashrc_interactive_guard(
         self, tmp_path, monkeypatch
     ):

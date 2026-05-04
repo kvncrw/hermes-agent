@@ -345,6 +345,7 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        run_env = _make_run_env(self.env)
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
@@ -352,11 +353,25 @@ class LocalEnvironment(BaseEnvironment):
         # Non-login invocations are already sourcing the snapshot and
         # don't need this.
         if login:
+            restore_path = ""
+            if run_env.get("PATH"):
+                # bash -l may reset PATH from /etc/profile before executing
+                # the bootstrap command. Preserve the process/container PATH
+                # after profile sourcing so Kubernetes-injected tool dirs
+                # (for example /opt/agent-tools/bin) survive in the snapshot.
+                run_env["HERMES_LOGIN_BASE_PATH"] = run_env["PATH"]
+                restore_path = (
+                    'if [ -n "${HERMES_LOGIN_BASE_PATH:-}" ]; then\n'
+                    '  export PATH="${HERMES_LOGIN_BASE_PATH}:$PATH"\n'
+                    '  unset HERMES_LOGIN_BASE_PATH\n'
+                    "fi\n"
+                )
             init_files = _resolve_shell_init_files()
             if init_files:
-                cmd_string = _prepend_shell_init(cmd_string, init_files)
+                cmd_string = _prepend_shell_init(restore_path + cmd_string, init_files)
+            else:
+                cmd_string = restore_path + cmd_string
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
-        run_env = _make_run_env(self.env)
 
         proc = subprocess.Popen(
             args,
