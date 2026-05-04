@@ -5305,6 +5305,152 @@ class AIAgent:
 
         return None
 
+    def _resolve_skill_name_for_tool_call(self, tool_name: str) -> str | None:
+        """Return a skill name when a model calls a skill slug as a tool.
+
+        Open-weights models sometimes confuse skill names from the skills index
+        (for example ``github-issues``) with callable tool names.  The callable
+        tool is ``skill_view``; this resolver maps the hallucinated skill-tool
+        name back to the canonical skill name so the normal tool loop can load
+        the skill instead of burning retries on "Unknown tool".
+        """
+        if "skill_view" not in getattr(self, "valid_tool_names", set()):
+            return None
+        if not tool_name:
+            return None
+
+        candidate = str(tool_name).strip().lstrip("/")
+        if not candidate:
+            return None
+        candidate = candidate.lower().replace("_", "-").replace(" ", "-")
+
+        try:
+            from agent.skill_commands import get_skill_commands, resolve_skill_command_key
+
+            cmd_key = resolve_skill_command_key(candidate)
+            if not cmd_key:
+                return None
+            info = get_skill_commands().get(cmd_key) or {}
+            resolved = str(info.get("name") or cmd_key.lstrip("/")).strip()
+            return resolved or None
+        except Exception as exc:
+            logger.debug("Skill tool-name repair failed for %r: %s", tool_name, exc)
+            return None
+
+    def _repair_tool_call_for_execution(self, tool_call) -> tuple[str, str] | None:
+        """Repair a tool call object in-place before validation/execution."""
+        function = getattr(tool_call, "function", None)
+        if function is None:
+            return None
+
+        original_name = getattr(function, "name", None)
+        if not original_name or original_name in self.valid_tool_names:
+            return None
+
+        repaired = self._repair_tool_call(original_name)
+        if repaired:
+            function.name = repaired
+            return original_name, repaired
+
+        skill_name = self._resolve_skill_name_for_tool_call(original_name)
+        if not skill_name:
+            return None
+
+        payload: dict[str, Any] = {"name": skill_name}
+        raw_args = getattr(function, "arguments", None)
+        parsed_args = None
+        if isinstance(raw_args, dict):
+            parsed_args = raw_args
+        elif isinstance(raw_args, str) and raw_args.strip():
+            try:
+                parsed_args = json.loads(raw_args)
+            except Exception:
+                parsed_args = None
+
+        if isinstance(parsed_args, dict) and isinstance(parsed_args.get("file_path"), str):
+            payload["file_path"] = parsed_args["file_path"]
+
+        function.name = "skill_view"
+        function.arguments = json.dumps(payload, ensure_ascii=False)
+        return original_name, "skill_view"
+
+    def _parse_bare_textual_tool_call(self, content: str):
+        """Convert a bare textual skill tool call into a structured tool call.
+
+        This intentionally handles only the common low-risk recovery forms:
+        ``skill_view(...)`` and ``skills_list(...)`` as the entire assistant
+        message.  It does not parse arbitrary prose or terminal/file tool calls.
+        """
+        if not isinstance(content, str):
+            return None
+
+        text = self._strip_think_blocks(content).strip()
+        if not text or len(text) > 500:
+            return None
+
+        try:
+            import ast
+
+            parsed = ast.parse(text, mode="eval")
+        except SyntaxError:
+            return None
+
+        expr = parsed.body
+        if not isinstance(expr, ast.Call) or not isinstance(expr.func, ast.Name):
+            return None
+
+        function_name = expr.func.id
+        if function_name not in {"skill_view", "skills_list"}:
+            return None
+        if function_name not in self.valid_tool_names:
+            return None
+
+        allowed = (
+            {"name", "file_path"} if function_name == "skill_view" else {"category"}
+        )
+        args: dict[str, Any] = {}
+
+        def _literal_string(node):
+            try:
+                value = ast.literal_eval(node)
+            except Exception:
+                return None
+            return value if isinstance(value, str) else None
+
+        if function_name == "skill_view":
+            if len(expr.args) > 2:
+                return None
+            if expr.args:
+                value = _literal_string(expr.args[0])
+                if not value:
+                    return None
+                args["name"] = value
+            if len(expr.args) == 2:
+                value = _literal_string(expr.args[1])
+                if value is None:
+                    return None
+                args["file_path"] = value
+        elif expr.args:
+            return None
+
+        for kw in expr.keywords:
+            if kw.arg is None or kw.arg not in allowed:
+                return None
+            value = _literal_string(kw.value)
+            if value is None:
+                return None
+            args[kw.arg] = value
+
+        if function_name == "skill_view" and not args.get("name"):
+            return None
+
+        arguments = json.dumps(args, ensure_ascii=False)
+        return SimpleNamespace(
+            id=self._deterministic_call_id(function_name, arguments, 0),
+            type="function",
+            function=SimpleNamespace(name=function_name, arguments=arguments),
+        )
+
     def _invalidate_system_prompt(self):
         """
         Invalidate the cached system prompt, forcing a rebuild on the next turn.
@@ -12787,6 +12933,20 @@ class AIAgent:
                     }
                 elif hasattr(self, "_codex_incomplete_retries"):
                     self._codex_incomplete_retries = 0
+
+                if not assistant_message.tool_calls:
+                    recovered_tool_call = self._parse_bare_textual_tool_call(
+                        assistant_message.content
+                    )
+                    if recovered_tool_call is not None:
+                        self._vprint(
+                            f"{self.log_prefix}🔧 Recovered textual tool call: "
+                            f"{recovered_tool_call.function.name}",
+                            force=True,
+                        )
+                        assistant_message.content = ""
+                        assistant_message.tool_calls = [recovered_tool_call]
+                        finish_reason = "tool_calls"
                 
                 # Check for tool calls
                 if assistant_message.tool_calls:
@@ -12801,10 +12961,10 @@ class AIAgent:
                     # Repair mismatched tool names before validating
                     for tc in assistant_message.tool_calls:
                         if tc.function.name not in self.valid_tool_names:
-                            repaired = self._repair_tool_call(tc.function.name)
+                            repaired = self._repair_tool_call_for_execution(tc)
                             if repaired:
-                                print(f"{self.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
-                                tc.function.name = repaired
+                                original, repaired_name = repaired
+                                print(f"{self.log_prefix}🔧 Auto-repaired tool name: '{original}' -> '{repaired_name}'")
                     invalid_tool_calls = [
                         tc.function.name for tc in assistant_message.tool_calls
                         if tc.function.name not in self.valid_tool_names

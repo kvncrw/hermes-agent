@@ -11,6 +11,7 @@ falls back to fuzzy match.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -115,3 +116,61 @@ class TestEdgeCases:
     def test_very_long_name_does_not_match_by_accident(self, repair):
         # Fuzzy match should not claim a tool for something obviously unrelated.
         assert repair("ThisIsNotRemotelyARealToolName_tool") is None
+
+
+class TestSkillToolConfusionRepair:
+    """Local models may call a skill slug as though it were a tool."""
+
+    def test_skill_slug_tool_call_rewrites_to_skill_view(self, monkeypatch):
+        from run_agent import AIAgent
+
+        stub = SimpleNamespace(valid_tool_names={"skill_view"})
+        stub._repair_tool_call = AIAgent._repair_tool_call.__get__(stub, AIAgent)
+        stub._resolve_skill_name_for_tool_call = (
+            AIAgent._resolve_skill_name_for_tool_call.__get__(stub, AIAgent)
+        )
+        repair_call = AIAgent._repair_tool_call_for_execution.__get__(stub, AIAgent)
+
+        monkeypatch.setattr(
+            "agent.skill_commands.resolve_skill_command_key",
+            lambda command: "/github-issues" if command == "github-issues" else None,
+        )
+        monkeypatch.setattr(
+            "agent.skill_commands.get_skill_commands",
+            lambda: {"/github-issues": {"name": "github-issues"}},
+        )
+
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(
+                name="github_issues",
+                arguments='{"action":"create","title":"bug"}',
+            )
+        )
+
+        assert repair_call(tool_call) == ("github_issues", "skill_view")
+        assert tool_call.function.name == "skill_view"
+        assert json.loads(tool_call.function.arguments) == {"name": "github-issues"}
+
+    def test_bare_textual_skill_view_is_recovered_as_tool_call(self):
+        from run_agent import AIAgent
+
+        stub = SimpleNamespace(valid_tool_names={"skill_view"})
+        stub._strip_think_blocks = lambda content: content
+        stub._deterministic_call_id = AIAgent._deterministic_call_id
+        parse = AIAgent._parse_bare_textual_tool_call.__get__(stub, AIAgent)
+
+        tool_call = parse("skill_view(name='github-issues')")
+
+        assert tool_call is not None
+        assert tool_call.function.name == "skill_view"
+        assert json.loads(tool_call.function.arguments) == {"name": "github-issues"}
+
+    def test_bare_textual_recovery_ignores_prose(self):
+        from run_agent import AIAgent
+
+        stub = SimpleNamespace(valid_tool_names={"skill_view"})
+        stub._strip_think_blocks = lambda content: content
+        stub._deterministic_call_id = AIAgent._deterministic_call_id
+        parse = AIAgent._parse_bare_textual_tool_call.__get__(stub, AIAgent)
+
+        assert parse("I should call skill_view(name='github-issues') next.") is None
