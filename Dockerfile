@@ -127,7 +127,11 @@ RUN npm install --prefer-offline --no-audit && \
     npm cache clean --force && \
     ln -sf /opt/hermes/node_modules/.bin/agent-browser /usr/local/bin/agent-browser
 
-RUN bash -lc 'command -v bash curl wget git node npm python3 gcc g++ make pkg-config cmake jq rg ffmpeg chromium agent-browser' && \
+RUN printf '%s\n' \
+      'export PATH="/opt/agent-tools/bin:/opt/data/bin:/opt/hermes/node_modules/.bin:/opt/data/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+      > /etc/profile.d/hermes-path.sh
+
+RUN bash -lc 'case ":$PATH:" in *:/opt/data/bin:*) ;; *) exit 1 ;; esac; command -v bash curl wget git node npm python3 gcc g++ make pkg-config cmake jq rg ffmpeg chromium agent-browser' && \
     agent-browser --version
 
 # ---------- Source code ----------
