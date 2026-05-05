@@ -13,6 +13,7 @@ import pytest
 
 from tools.environments.local import (
     LocalEnvironment,
+    _prepend_inherited_path,
     _prepend_shell_init,
     _read_terminal_shell_init_config,
     _resolve_shell_init_files,
@@ -183,6 +184,17 @@ class TestPrependShellInit:
         assert "o'\\''malley" in wrapped
 
 
+class TestPrependInheritedPath:
+    def test_empty_path_returns_command_unchanged(self):
+        assert _prepend_inherited_path("echo hi", "") == "echo hi"
+
+    def test_restores_inherited_path_before_command(self):
+        wrapped = _prepend_inherited_path("echo hi", "/opt/agent-tools/bin:/usr/bin")
+        assert wrapped.startswith("export PATH=/opt/agent-tools/bin:/usr/bin")
+        assert '${PATH:+:$PATH}' in wrapped
+        assert wrapped.endswith("echo hi")
+
+
 @pytest.mark.skipif(
     os.environ.get("CI") == "true" and not os.path.isfile("/bin/bash"),
     reason="Requires bash; CI sandbox may strip it.",
@@ -213,6 +225,34 @@ class TestSnapshotEndToEnd:
         output = result.get("output", "")
         assert "PROBE=probe-ok" in output
         assert "/opt/shell-init-probe/bin" in output
+
+    def test_snapshot_preserves_inherited_path_after_login_shell_reset(
+        self, tmp_path, monkeypatch
+    ):
+        injected_bin = tmp_path / "k8s-tools" / "bin"
+        injected_bin.mkdir(parents=True)
+        marker = injected_bin / "k8s-marker"
+        marker.write_text("#!/bin/sh\nprintf k8s-path-ok\n")
+        marker.chmod(0o755)
+
+        monkeypatch.setenv("PATH", f"{injected_bin}:{os.environ.get('PATH', '')}")
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute(
+                    'command -v k8s-marker; echo "PATH=$PATH"; k8s-marker'
+                )
+            finally:
+                env.cleanup()
+
+        output = result.get("output", "")
+        assert str(marker) in output
+        assert str(injected_bin) in output
+        assert "k8s-path-ok" in output
 
     def test_profile_path_export_survives_bashrc_interactive_guard(
         self, tmp_path, monkeypatch

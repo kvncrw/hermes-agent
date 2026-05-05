@@ -3,6 +3,7 @@
 import os
 import platform
 import shutil
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -296,6 +297,13 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return prelude + cmd_string
 
 
+def _prepend_inherited_path(cmd_string: str, inherited_path: str) -> str:
+    """Restore parent PATH after login shell startup files have run."""
+    if not inherited_path:
+        return cmd_string
+    return f"export PATH={shlex.quote(inherited_path)}${{PATH:+:$PATH}}\n{cmd_string}"
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 
@@ -338,18 +346,21 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        run_env = _make_run_env(self.env)
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
         # (nvm, asdf, pyenv, …) end up on PATH in the captured snapshot.
-        # Non-login invocations are already sourcing the snapshot and
-        # don't need this.
+        # Then restore the parent PATH because bash -l may reset Kubernetes /
+        # systemd injected entries before the command string is evaluated.
+        # Non-login invocations are already sourcing the snapshot and don't
+        # need this.
         if login:
             init_files = _resolve_shell_init_files()
+            cmd_string = _prepend_inherited_path(cmd_string, run_env.get("PATH", ""))
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
-        run_env = _make_run_env(self.env)
 
         proc = subprocess.Popen(
             args,

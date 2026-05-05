@@ -43,13 +43,60 @@ ENV PYTHONUNBUFFERED=1
 # Store Playwright browsers outside the volume mount so the build-time
 # install survives the /opt/data volume overlay at runtime.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+ENV PATH="/opt/agent-tools/bin:/opt/data/bin:/opt/hermes/node_modules/.bin:/opt/data/.local/bin:${PATH}"
 
 # Install system dependencies in one layer, clear APT cache
 # tini reaps orphaned zombie processes (MCP stdio subprocesses, git, bun, etc.)
 # that would otherwise accumulate when hermes runs as PID 1. See #15012.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini && \
+        bash \
+        build-essential \
+        bzip2 \
+        ca-certificates \
+        chromium \
+        chromium-driver \
+        cmake \
+        curl \
+        dnsutils \
+        docker-cli \
+        ffmpeg \
+        file \
+        g++ \
+        gcc \
+        git \
+        git-lfs \
+        gnupg \
+        gzip \
+        iproute2 \
+        iputils-ping \
+        jq \
+        less \
+        lsof \
+        make \
+        netcat-openbsd \
+        ninja-build \
+        nodejs \
+        npm \
+        openssh-client \
+        openssl \
+        pkg-config \
+        procps \
+        python3 \
+        python3-dev \
+        rsync \
+        ripgrep \
+        strace \
+        tar \
+        tini \
+        unzip \
+        wget \
+        xz-utils \
+        zip \
+        zstd \
+        libffi-dev \
+        libssl-dev \
+        zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Ops tools + capbroker baked at build time. Avoids per-pod-boot downloads
@@ -77,7 +124,11 @@ COPY web/package.json web/package-lock.json web/
 RUN npm install --prefer-offline --no-audit && \
     npx playwright install --with-deps chromium --only-shell && \
     (cd web && npm install --prefer-offline --no-audit) && \
-    npm cache clean --force
+    npm cache clean --force && \
+    ln -sf /opt/hermes/node_modules/.bin/agent-browser /usr/local/bin/agent-browser
+
+RUN bash -lc 'command -v bash curl wget git node npm python3 gcc g++ make pkg-config cmake jq rg ffmpeg chromium agent-browser' && \
+    agent-browser --version
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -101,6 +152,7 @@ RUN uv venv && \
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_HOME=/opt/data
-ENV PATH="/opt/data/.local/bin:${PATH}"
+ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 VOLUME [ "/opt/data" ]
 ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]
