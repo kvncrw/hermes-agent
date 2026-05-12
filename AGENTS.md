@@ -230,14 +230,14 @@ Newline-delimited JSON-RPC over stdio. Requests from Ink, events from Python. Se
 
 ```bash
 cd ui-tui
-npm install       # first time
-npm run dev       # watch mode (rebuilds hermes-ink + tsx --watch)
+pnpm install       # first time
+pnpm run dev       # watch mode (rebuilds hermes-ink + tsx --watch)
 npm start         # production
-npm run build     # full build (hermes-ink + tsc)
-npm run type-check # typecheck only (tsc --noEmit)
-npm run lint      # eslint
-npm run fmt       # prettier
-npm test          # vitest
+pnpm run build     # full build (hermes-ink + tsc)
+pnpm run type-check # typecheck only (tsc --noEmit)
+pnpm run lint      # eslint
+pnpm run fmt       # prettier
+pnpm test          # vitest
 ```
 
 ### TUI in the Dashboard (`hermes dashboard` → `/chat`)
